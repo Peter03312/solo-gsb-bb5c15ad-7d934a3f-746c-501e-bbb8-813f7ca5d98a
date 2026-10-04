@@ -697,6 +697,12 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
   带 `auto_approved: true` 与 `release_revision`（触发它的暂停/撤销修订号），按其中
   任一修订号查询即可逐项还原自动审批；当前快照另附候补队列
   `waitlist_application_ids` / `waitlist_entries`。
+  批准记录内嵌的 `application` 对象同样是**该修订号的事件回放视图**：其 `status`、
+  `approval_revision`、`suspended_revision` 与 `force_suspended_by` 按截至该修订的
+  批准/暂停/恢复/撤销/紧急解除事件重放得出（撤销后保留暂停号作历史标记，与实时
+  行的写法一致），之后的恢复、撤销或紧急占频解除**不会改写**旧修订号的视图；
+  当前状态接口（`GET /api/applications/{id}`、`/api/revision/current` 等）仍反映
+  实时状态。
 - `GET /api/revision/{n}` 还原修订号 **n 当时**的批准、暂停、恢复、撤销记录、
   **当时生效的保护带宽**、带宽变更记录及**当时生效的管制窗口与窗口启用/解除记录**
   （`n` 超过当前修订号返回 404）。
@@ -707,7 +713,8 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
   `restriction_window_released` 事件（合并字段为 `differences`；各类事件也分别在
   `approvals`、`suspensions`、`resumptions`、`revocations`、`guard_band_changes`、
   `restriction_window_events` 中返回）、逐次 `status_changes`，其中审批事件保留
-  `auto_approved` 与 `release_revision`。可选 `application_id` 只筛选该申请的
+  `auto_approved` 与 `release_revision`，其内嵌 `application` 同样是**较新一侧
+  修订号**的事件回放视图（不随之后的写入改变）。可选 `application_id` 只筛选该申请的
   许可事件（保护带宽与管制窗口变更仍返回）；未知申请返回 404。该接口只读取事件表，
   不修改申请、许可、候补队列、管制窗口或修订号。
 
@@ -979,6 +986,33 @@ curl -s http://localhost:8000/api/revision/2
 curl -s http://localhost:8000/api/revision/999
 # HTTP 404 {"error": {"code": "revision_out_of_range", ...}}
 ```
+
+批准记录内嵌的 `application` 同样是**该修订号当时**的视图。设许可 A 在修订号
+**1** 获批、修订号 **2** 被暂停（`POST /api/applications/1/suspend`），则修订号 1
+的批准记录内嵌申请仍是 `approved`、无暂停号——之后的暂停不会改写旧视图：
+
+```bash
+curl -s http://localhost:8000/api/revision/1
+# {"revision": 1, "effective_application_ids": [1],
+#  "approvals": [{"revision": 1, "application_id": 1, "status_as_of": "approved",
+#    "application": {"id": 1, "status": "approved",
+#                    "approval_revision": 1, "suspended_revision": null,
+#                    "force_suspended_by": null, ...}}], ...}
+
+curl -s http://localhost:8000/api/revision/2
+# {"revision": 2, "effective_application_ids": [], "suspended_application_ids": [1],
+#  "approvals": [{"revision": 1, "application_id": 1, "status_as_of": "suspended",
+#    "suspended_at_revision": 2,
+#    "application": {"id": 1, "status": "suspended",
+#                    "approval_revision": 1, "suspended_revision": 2,
+#                    "force_suspended_by": null, ...}}], ...}
+```
+
+之后在修订号 **3** 恢复（`POST /api/applications/1/resume`）再查修订号 1、2，结果
+与上面完全一致；被紧急占频强制暂停的许可同理——旧修订号视图中的
+`force_suspended_by` 仍是当时强制它的紧急申请，紧急解除不会追改。修订对比
+（`/api/revision/compare`）区间内审批事件的内嵌申请同理取**较新一侧修订号**的回放
+视图；而 `GET /api/applications/1` 与 `/api/revision/current` 始终反映实时状态。
 
 ### 6.11 临界值速查（保护带宽 2 MHz）
 
