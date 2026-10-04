@@ -697,6 +697,16 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
   带 `auto_approved: true` 与 `release_revision`（触发它的暂停/撤销修订号），按其中
   任一修订号查询即可逐项还原自动审批；当前快照另附候补队列
   `waitlist_application_ids` / `waitlist_entries`。
+- 批准记录内嵌的 `application` 同样是**该修订当时**的投影，而非实时申请行：其中
+  `status`、`approval_revision`、`suspended_revision`、`force_suspended_by` 均由截至
+  该修订的批准/暂停/恢复/撤销事件回放得出（与同记录的 `status_as_of` 一致）。许可在
+  修订 1 获批、修订 2 暂停后，按修订 1 查询的批准记录内嵌申请仍是
+  `status: "approved"`、`suspended_revision: null`；按修订 2 查询才是
+  `status: "suspended"`、`suspended_revision: 2`。后续恢复、撤销或紧急占频解除只写入
+  新事件，**不回改任何旧修订视图**（紧急解除后，修订前视图中的 `force_suspended_by`
+  仍是当时强制暂停它的紧急申请；解除修订起，未恢复的许可回退为普通暂停，该字段为
+  `null`）。字段形状与取值范围与实时申请对象保持一致；实时状态仍以
+  `GET /api/applications/{id}` 与 `GET /api/revision/current` 为准。
 - `GET /api/revision/{n}` 还原修订号 **n 当时**的批准、暂停、恢复、撤销记录、
   **当时生效的保护带宽**、带宽变更记录及**当时生效的管制窗口与窗口启用/解除记录**
   （`n` 超过当前修订号返回 404）。

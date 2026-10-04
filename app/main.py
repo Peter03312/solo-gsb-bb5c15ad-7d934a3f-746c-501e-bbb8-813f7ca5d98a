@@ -1775,39 +1775,122 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
 
     # Replay every lifecycle event up to the target revision in revision
     # order; the last event of each application decides its as-of state.
-    # (revision, kind, application_id, marker_revision); approval precedes
-    # any other event of the same revision because every revision has exactly
-    # one event.
+    # Every revision carries exactly one event, so ordering by revision alone
+    # is deterministic.  Unlike the live ``applications`` row (which later
+    # decisions mutate in place), this replay is the audit truth *at* the
+    # target revision: a later resume/revoke/emergency release never reaches
+    # back into an older snapshot.
     lifecycle: list[tuple[int, str, int]] = []
-    lifecycle.extend((ev.revision, "approved", ev.application_id) for ev in approvals)
+    lifecycle.extend(
+        (ev.revision, "approved", ev.application_id) for ev in approvals
+    )
     lifecycle.extend(
         (ev.revision, "suspended", ev.application_id) for ev in suspensions
     )
     lifecycle.extend(
         (ev.revision, "approved", ev.application_id) for ev in resumptions
     )
-    lifecycle.extend((ev.revision, "revoked", ev.application_id) for ev in revocations)
+    lifecycle.extend(
+        (ev.revision, "revoked", ev.application_id) for ev in revocations
+    )
     lifecycle.sort(key=lambda item: item[0])
-    # state[app_id] = (state, latest marker revision): marker is the
-    # suspension revision while suspended, the revocation revision once
-    # revoked, and irrelevant while approved.
-    state: dict[int, tuple[str, int]] = {}
+
+    # Latest suspension event per application: together with the set of
+    # released emergencies it identifies whether a suspension as-of the
+    # target revision was still forced by an active emergency occupation.
+    last_suspension: dict[int, SuspensionEvent] = {}
+    for ev in suspensions:
+        prev = last_suspension.get(ev.application_id)
+        if prev is None or ev.revision >= prev.revision:
+            last_suspension[ev.application_id] = ev
+
+    # Emergency occupations whose release had already happened at or before
+    # the target revision.  From the release revision on, a license that is
+    # still suspended (its forced recovery was blocked) is an ordinary
+    # suspension again -- the emergency force source is gone -- exactly like
+    # the live row the release writes.
+    released_emergency_ids = {
+        occ.emergency_application_id
+        for occ in occupations
+        if occ.released_revision is not None
+        and occ.released_revision <= revision
+    }
+
+    # Replayed per-application state.  ``revision`` is the deciding event's
+    # revision (suspension revision while suspended, revocation revision once
+    # revoked).  ``suspended_revision`` mirrors the live marker column: set
+    # by every suspension, cleared by every approval/resumption, and left in
+    # place by a revoke (the live row keeps it as a historical marker).
+    state: dict[int, dict[str, Any]] = {}
     for rev, kind, app_id in lifecycle:
+        current = state.setdefault(
+            app_id,
+            {
+                "status": "pending",
+                "revision": None,
+                "suspended_revision": None,
+            },
+        )
+        current["revision"] = rev
         if kind == "suspended":
-            state[app_id] = ("suspended", rev)
+            current["status"] = "suspended"
+            current["suspended_revision"] = rev
         elif kind == "revoked":
-            state[app_id] = ("revoked", rev)
+            current["status"] = "revoked"
+            # suspended_revision is deliberately retained, like the live row.
         else:
-            state[app_id] = ("approved", rev)
+            current["status"] = "approved"
+            current["suspended_revision"] = None
 
     approval_records: list[dict[str, Any]] = []
     effective_ids: list[int] = []
     suspended_ids: list[int] = []
     for ev in approvals:
         app = session.get(Application, ev.application_id)
-        status_as_of, marker = state.get(
-            ev.application_id, ("approved", ev.revision)
+        replay = state.get(ev.application_id)
+        if replay is None:
+            status_as_of, marker = "approved", ev.revision
+        else:
+            status_as_of, marker = replay["status"], replay["revision"]
+
+        # The embedded application must describe the license as-of the
+        # queried revision, not the (continuously mutated) live row.
+        if status_as_of == "suspended":
+            suspended_revision_as_of = replay["suspended_revision"]
+            susp = last_suspension.get(ev.application_id)
+            force_id = (
+                susp.forced_by_emergency_application_id
+                if susp is not None
+                else None
+            )
+            if (
+                susp is not None
+                and susp.forced
+                and (force_id or 0) not in released_emergency_ids
+            ):
+                force_suspended_by_as_of = force_id
+            else:
+                force_suspended_by_as_of = None
+        elif status_as_of == "revoked":
+            # The live revoke keeps the suspension marker but clears the
+            # emergency force source.
+            suspended_revision_as_of = (
+                replay["suspended_revision"] if replay is not None else None
+            )
+            force_suspended_by_as_of = None
+        else:
+            suspended_revision_as_of = None
+            force_suspended_by_as_of = None
+
+        application_view = (
+            serialize_application(app) if app is not None else None
         )
+        if application_view is not None:
+            application_view["status"] = status_as_of
+            application_view["approval_revision"] = ev.revision
+            application_view["suspended_revision"] = suspended_revision_as_of
+            application_view["force_suspended_by"] = force_suspended_by_as_of
+
         record = {
             "revision": ev.revision,
             "application_id": ev.application_id,
@@ -1827,7 +1910,11 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
             "created_at": iso(ev.created_at),
             # Status of this grant *as of the queried revision*.
             "status_as_of": status_as_of,
-            "application": serialize_application(app) if app else None,
+            # Application row projected to the queried revision: the static
+            # fields come from the application, the live-marker fields
+            # (status / approval_revision / suspended_revision /
+            # force_suspended_by) come from the replay above.
+            "application": application_view,
         }
         if status_as_of == "revoked":
             record["revoked_at_revision"] = marker
@@ -1933,12 +2020,6 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
     # revision (exclusive).  The forced suspensions / forced recoveries /
     # emergency approval / release revocation are already ordinary events in
     # the lifecycle replay above; these records only link them for audit.
-    last_suspension: dict[int, SuspensionEvent] = {}
-    for ev in suspensions:
-        prev = last_suspension.get(ev.application_id)
-        if prev is None or ev.revision >= prev.revision:
-            last_suspension[ev.application_id] = ev
-
     active_emergency_ids: list[int] = []
     emergency_records: list[dict[str, Any]] = []
     for occ in occupations:
@@ -2005,8 +2086,7 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
             # Only genuinely still-suspended licenses count as force
             # suspended at the revision.
             for app_id in list(still_forced):
-                status_as_of, _ = state.get(app_id, ("approved", 0))
-                if status_as_of != "suspended":
+                if state.get(app_id, {}).get("status", "approved") != "suspended":
                     still_forced_set.discard(app_id)
             record["still_force_suspended_application_ids"] = sorted(
                 still_forced_set
@@ -2021,17 +2101,13 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
     # correctly) and had not yet been released at or before the target
     # revision (once the emergency release begins, the license is no longer
     # held by an active emergency, even if its restoration lands on the next
-    # revision).
-    released_emergency_ids = {
-        occ.emergency_application_id
-        for occ in occupations
-        if occ.released_revision is not None
-        and occ.released_revision <= revision
-    }
+    # revision).  ``released_emergency_ids`` was computed before the approval
+    # records above (same as ``last_suspension``) so the embedded application
+    # projection shares exactly this rule.
     active_emergency_set = set(active_emergency_ids)
     force_suspended_ids: list[int] = []
-    for app_id, (status_as_of, _marker) in state.items():
-        if status_as_of != "suspended":
+    for app_id, replay in state.items():
+        if replay["status"] != "suspended":
             continue
         susp = last_suspension.get(app_id)
         if (
